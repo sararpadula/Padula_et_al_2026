@@ -1,0 +1,1137 @@
+---
+title: "Padula_2025_response_to_reviewers_analysis"
+author: "Sara Padula"
+date: "2026-10-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+#loading libraries
+
+library(dplyr)
+library(cowplot)
+library(ggplot2)
+library(jpeg)
+library(png)
+library(readxl)
+library(stringr)
+library(tidyr)
+```
+
+# Reviewer comment: add a study-site map
+
+Make Figure 1 with the study site map as panel A.
+
+```{r}
+#reading in data
+
+BS <- read.csv("paired_SMI (2).csv")
+BSpop <- read.csv("population_SMI (2).csv")
+nestbox_coords <- read_excel("C:/Users/sarap/Downloads/2025 nest box list.xlsx",
+                             sheet = "nest box list")
+
+output_dir <- "response_to_reviewers_outputs"
+dir.create(output_dir, showWarnings = FALSE)
+```
+
+Clean up nestbox numbers and locations so the breeding data can be matched to the coordinate file
+
+```{r}
+clean_location_code <- function(x) {
+  x <- str_squish(as.character(x))
+  x_upper <- str_to_upper(x)
+
+  case_when(str_starts(x_upper, "BLD") | x_upper == "CU" ~ "BLD",
+    str_detect(x_upper, "SUGARLOAF") | str_starts(x_upper, "SGR") | x_upper == "BLD/SGR" ~ "SGR",str_starts(x_upper, "NED") ~ "NED",str_starts(x_upper, "MRS") ~ "MRS",str_starts(x_upper, "FLG") ~ "FLG",TRUE ~ x_upper)
+}
+
+get_box_number <- function(x) {
+  as.integer(str_extract(as.character(x), "\\d+"))
+}
+
+BS <- BS %>%
+  mutate(Location = str_squish(as.character(Location)),
+    Nestbox = str_squish(as.character(Nestbox)),Species = str_squish(as.character(Species)),Year = as.integer(Year),location_code_clean = clean_location_code(Location), box_number = get_box_number(Nestbox))
+
+BSpop <- BSpop %>%
+  mutate(Species = str_squish(as.character(Species)),
+    Sex = str_squish(as.character(Sex)),ID = str_squish(as.character(ID)),
+    Nestbox = str_squish(as.character(Nestbox)),
+    Year = as.integer(Year))
+
+nestbox_coords <- nestbox_coords %>%
+  transmute(coordinate_location = str_squish(as.character(Location)),
+    location_code_clean = clean_location_code(Location),
+    box_number = as.integer(as.numeric(Box.number)),
+    longitude = as.numeric(GPS.Longitude_E),
+    latitude = as.numeric(GPS.Latitide_N)) %>%
+  filter(!is.na(box_number), !is.na(longitude), !is.na(latitude)) %>%
+  distinct(location_code_clean, box_number, .keep_all = TRUE)
+
+map_points <- BS %>%
+  left_join(nestbox_coords, by = c("location_code_clean", "box_number")) %>%
+  filter(!is.na(longitude), !is.na(latitude))
+```
+
+Functions for the map background
+
+```{r}
+lonlat_to_tile <- function(lon, lat, zoom) {
+  lat_rad <- lat * pi / 180
+  n <- 2^zoom
+
+  data.frame(x = floor((lon + 180) / 360 * n),
+    y = floor((1 - log(tan(lat_rad) + 1 / cos(lat_rad)) / pi) / 2 * n))
+}
+
+tile_to_lonlat_bounds <- function(x, y, zoom) {
+  n <- 2^zoom
+
+  c(xmin = x / n * 360 - 180,
+    xmax = (x + 1) / n * 360 - 180,
+    ymin = atan(sinh(pi * (1 - 2 * (y + 1) / n))) * 180 / pi,
+    ymax = atan(sinh(pi * (1 - 2 * y / n))) * 180 / pi)
+}
+
+read_map_tile <- function(tile_path) {
+  tile <- try(readPNG(tile_path), silent = TRUE)
+
+  if (inherits(tile, "try-error")) {
+    tile <- try(readJPEG(tile_path), silent = TRUE)
+  }
+
+  if (length(dim(tile)) == 2) {
+    tile <- array(rep(tile, 4), dim = c(dim(tile), 4))
+    tile[, , 4] <- 1
+  }
+
+  if (length(dim(tile)) == 3 & dim(tile)[3] == 3) {
+    tile <- array(
+      c(tile, rep(1, dim(tile)[1] * dim(tile)[2])),
+      dim = c(dim(tile)[1], dim(tile)[2], 4))
+  }
+
+  tile
+}
+
+get_shaded_relief_map <- function(bbox, zoom = 13) {
+  cache_dir <- file.path(output_dir, "map_tiles")
+  dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+
+  northwest <- lonlat_to_tile(bbox["xmin"], bbox["ymax"], zoom)
+  southeast <- lonlat_to_tile(bbox["xmax"], bbox["ymin"], zoom)
+
+  x_tiles <- seq(northwest$x, southeast$x)
+  y_tiles <- seq(northwest$y, southeast$y)
+  tile_size <- 256
+
+  map_image <- array(1, dim = c(tile_size * length(y_tiles),
+                                tile_size * length(x_tiles),
+                                4))
+
+  for (ix in seq_along(x_tiles)) {
+    for (iy in seq_along(y_tiles)) {
+      x_tile <- x_tiles[ix]
+      y_tile <- y_tiles[iy]
+
+      tile_path <- file.path(cache_dir, paste("esri_shaded", zoom, x_tile, y_tile, "png", sep = "_"))
+      tile_url <- sprintf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/%s/%s/%s",
+        zoom, y_tile, x_tile)
+
+      if (!file.exists(tile_path)) {
+        download.file(tile_url, destfile = tile_path, mode = "wb", quiet = TRUE)
+      }
+
+      tile <- read_map_tile(tile_path)
+      row_index <- ((iy - 1) * tile_size + 1):(iy * tile_size)
+      col_index <- ((ix - 1) * tile_size + 1):(ix * tile_size)
+      map_image[row_index, col_index, ] <- tile
+    }
+  }
+
+  west_north <- tile_to_lonlat_bounds(min(x_tiles), min(y_tiles), zoom)
+  east_south <- tile_to_lonlat_bounds(max(x_tiles), max(y_tiles), zoom)
+
+  list(image = map_image,xmin = west_north["xmin"],xmax = east_south["xmax"],
+    ymin = east_south["ymin"],ymax = west_north["ymax"])
+}
+```
+
+Make the study site map
+
+```{r}
+
+species_base_cols <- c("BCCH" = "#0072B2",
+                       "MOCH" = "#CC79A7")
+
+make_year_palette <- function(years, species) {
+  years <- sort(unique(years))
+
+  if (species == "BCCH") {
+    cols <- colorRampPalette(c("#66D9FF", "#009FE3", "#0060A8"))(length(years))
+  }
+
+  if (species == "MOCH") {
+    cols <- colorRampPalette(c("#FF7AC1", "#EC2E90", "#B0005B"))(length(years))
+  }
+
+  names(cols) <- years
+  cols
+}
+
+years <- sort(unique(map_points$Year))
+
+species_year_cols <- c(
+  setNames(make_year_palette(years, "BCCH"), paste("BCCH", years, sep = "_")),
+  setNames(make_year_palette(years, "MOCH"), paste("MOCH", years, sep = "_")))
+
+map_points <- map_points %>%mutate(species_year = paste(Species, Year, sep = "_"),
+    species_year = factor(species_year, levels = names(species_year_cols)),
+    point_fill = species_year_cols[as.character(species_year)])
+
+map_bbox <- c(xmin = min(map_points$longitude, na.rm = TRUE) - 0.025,
+  xmax = max(map_points$longitude, na.rm = TRUE) + 0.025,
+  ymin = min(map_points$latitude, na.rm = TRUE) - 0.015,
+  ymax = max(map_points$latitude, na.rm = TRUE) + 0.015)
+
+map_background <- get_shaded_relief_map(map_bbox, zoom = 13)
+
+city_labels <- data.frame(place = c("Boulder", "Nederland"),
+  longitude = c(-105.2705, -105.5125),
+  latitude = c(40.0150, 39.9675))
+
+study_site_map_base <- ggplot(map_points, aes(x = longitude, y = latitude)) +
+  annotation_raster(map_background$image,
+    xmin = map_background$xmin,
+    xmax = map_background$xmax,
+    ymin = map_background$ymin,
+    ymax = map_background$ymax) +
+  geom_label(
+    data = city_labels,
+    aes(x = longitude, y = latitude, label = place),
+    inherit.aes = FALSE,
+    size = 3,
+    linewidth = 0,
+    fill = scales::alpha("white", 0.78),
+    color = "grey20") +
+  geom_point(aes(fill = point_fill, shape = Species),
+    color = "black",
+    stroke = 0.35,
+    size = 3.1,
+    alpha = 1,
+    position = position_jitter(width = 0.00045, height = 0.00035, seed = 2025)) +
+  scale_fill_identity() +
+  scale_shape_manual(values = c("BCCH" = 21, "MOCH" = 24)) +
+  coord_quickmap(xlim = c(map_bbox["xmin"], map_bbox["xmax"]),ylim = c(map_bbox["ymin"], map_bbox["ymax"]),
+    expand = FALSE) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none",
+    panel.border = element_rect(color = "grey35", fill = NA, linewidth = 0.4),
+    panel.background = element_rect(fill = "white", color = NA))
+
+year_legend_data <- expand_grid(
+  Species = c("MOCH", "BCCH"),
+  step = seq_len(120)) %>%
+  group_by(Species) %>%
+  mutate(Year = seq(min(years), max(years), length.out = n()),
+    fill = ifelse( Species == "BCCH",colorRampPalette(c("#66D9FF", "#009FE3", "#0060A8"))(n()),colorRampPalette(c("#FF7AC1", "#EC2E90", "#B0005B"))(n())),
+    Species = factor(Species, levels = c("MOCH", "BCCH"))) %>%
+  ungroup()
+
+gradient_key <- ggplot(year_legend_data, aes(x = Year, y = Species, fill = fill)) +
+  geom_tile(height = 0.65) +
+  scale_fill_identity() +
+  scale_x_continuous(breaks = range(years), labels = range(years), expand = c(0, 0)) +
+  xlab("Year") +
+  ylab("") +
+  theme_classic(base_size = 7) +
+  theme(legend.position = "none",
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.ticks.x = element_line(linewidth = 0.22),
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 6),
+    axis.title.x = element_text(size = 7, margin = margin(t = 0)),
+    plot.margin = margin(0, 6, 0, 0))
+
+side_key <- plot_grid(NULL,gradient_key,NULL,ncol = 1,rel_heights = c(0.38, 0.24, 0.38))
+
+study_site_map <- plot_grid(study_site_map_base,side_key,nrow = 1,rel_widths = c(1, 0.10))
+
+study_site_map
+
+ggsave(file.path(output_dir, "study_site_map_species_year.png"),plot = study_site_map,width = 8.2,height = 5.4,dpi = 600,bg = "white")
+```
+
+Make wing length panels from the original Figure 1 code
+
+```{r}
+BSpopI <- BSpop %>%
+  filter(Species %in% c("MOCH", "BCCH"),
+         Sex %in% c("F", "M"),
+         !is.na(Wing.Chord)) %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  mutate(Sex = factor(Sex, levels = c("F", "M")),
+    Nest.ID = paste(Nestbox, Year))
+
+BSMOCH <- subset(BS, Species == "MOCH")
+BSBCCH <- subset(BS, Species == "BCCH")
+BSpopMOCH <- subset(BSpopI, Species == "MOCH")
+BSpopBCCH <- subset(BSpopI, Species == "BCCH")
+
+BSPopplotMOCH <- BSpopMOCH %>%
+  group_by(Sex, Wing.Chord) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(n2 = n / 2)
+
+BSPopplotBCCH <- BSpopBCCH %>%
+  group_by(Sex, Wing.Chord) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(n2 = n / 2)
+
+sex_fill_cols <- c("F" = "#E1BE6A", "M" = "#40B0A6")
+
+mochBox <- ggplot(data = BSpopMOCH, aes(x = Sex, y = Wing.Chord)) +
+  geom_boxplot(aes(fill = Sex), alpha = 0.85, outlier.alpha = 0, width = 0.5, linewidth = 0.35) +
+  geom_line(aes(group = Nest.ID), alpha = 0.10, linewidth = 0.35) +
+  geom_point(data = BSPopplotMOCH, aes(size = n2), alpha = 0.50, color = "grey20") +
+  scale_fill_manual(values = sex_fill_cols) +
+  scale_size_area(max_size = 4) +
+  theme_cowplot() +
+  theme(legend.position = "none") +
+  xlab("Sex") +
+  ylab("Wing length (mm)") +
+  theme(axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9))
+
+bcchBox <- ggplot(data = BSpopBCCH, aes(x = Sex, y = Wing.Chord)) +
+  geom_boxplot(aes(fill = Sex), alpha = 0.85, outlier.alpha = 0, width = 0.5, linewidth = 0.35) +
+  geom_line(aes(group = Nest.ID), alpha = 0.10, linewidth = 0.35) +
+  geom_point(data = BSPopplotBCCH, aes(size = n2), alpha = 0.50, color = "grey20") +
+  scale_fill_manual(values = sex_fill_cols) +
+  scale_size_area(max_size = 4) +
+  theme_cowplot() +
+  theme(legend.position = "none") +
+  xlab("Sex") +
+  ylab("") +
+  theme(axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9))
+```
+
+Plot female and male wing length within pairs
+
+```{r}
+make_sma_fit <- function(data) {
+  data <- data %>%
+    filter(!is.na(Female.Wing.Chord), !is.na(Male.Wing.Chord))
+  r <- cor(data$Female.Wing.Chord, data$Male.Wing.Chord)
+  #Standardized major axis slope for two measured morphological traits.
+  slope <- sign(r) * sd(data$Male.Wing.Chord) / sd(data$Female.Wing.Chord)
+  intercept <- mean(data$Male.Wing.Chord) - slope * mean(data$Female.Wing.Chord)
+  x <- seq(min(data$Female.Wing.Chord), max(data$Female.Wing.Chord), length.out = 100)
+
+  list(intercept = intercept,slope = slope,r2 = r^2,line = data.frame(Female.Wing.Chord = x, Male.Wing.Chord = intercept + slope * x))
+}
+
+make_sma_label <- function(data) {
+  sma_fit <- make_sma_fit(data)
+
+  paste0("\"SMA: \"*italic(y) == ",
+         sprintf("%.2f", sma_fit$intercept),
+         " + ",
+         sprintf("%.2f", sma_fit$slope),
+         " %.% italic(x)",
+         "*','~~italic(R)^2 == ",
+         sprintf("%.2f", sma_fit$r2))
+}
+
+mochLine <- ggplot(data = BSMOCH, aes(x = Female.Wing.Chord, y = Male.Wing.Chord)) +
+  geom_point(size = 2.3, alpha = 0.35, color = "grey20") +
+  geom_line(data = make_sma_fit(BSMOCH)$line,
+            aes(x = Female.Wing.Chord, y = Male.Wing.Chord),
+            inherit.aes = FALSE,
+            color = "black",
+            linewidth = 0.6) +
+  annotate("text",x = 62.2, y = 66.1,label = make_sma_label(BSMOCH),parse = TRUE, hjust = 0,size = 3) +
+  theme_cowplot() +
+  xlab("Female wing length (mm)") +
+  ylab("Male wing length (mm)") +
+  theme(axis.title.x = element_text(size = 10, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 10, margin = margin(r = 8)),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9))
+
+bcchLine <- ggplot(data = BSBCCH, aes(x = Female.Wing.Chord, y = Male.Wing.Chord)) +
+  geom_point(size = 2.3, alpha = 0.35, color = "grey20") +
+  geom_line(data = make_sma_fit(BSBCCH)$line,
+            aes(x = Female.Wing.Chord, y = Male.Wing.Chord),
+            inherit.aes = FALSE,
+            color = "black",
+            linewidth = 0.6) +
+  annotate("text",x = 61.8,y = 72.6,label = make_sma_label(BSBCCH),parse = TRUE, hjust = 0, size = 3) +
+  theme_cowplot() +
+  xlab("Female wing length (mm)") +
+  ylab("") +
+  theme(axis.title.x = element_text(size = 10, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 10, margin = margin(r = 8)),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9))
+```
+
+Put the panels together and save the final figure
+
+```{r}
+wing_panels <- plot_grid(mochBox,
+  bcchBox,
+  mochLine,
+  bcchLine,
+  labels = c("B", "C", "D", "E"),
+  label_size = 12,
+  ncol = 2,
+  align = "hv")
+
+map_panel <- plot_grid(study_site_map_base,
+  side_key,
+  nrow = 1,
+  rel_widths = c(1, 0.10))
+
+figure_1_revised <- plot_grid(map_panel,
+  wing_panels,
+  labels = c("A", ""),
+  label_size = 12,
+  ncol = 1,
+  rel_heights = c(1.02, 1))
+
+figure_1_revised
+
+ggsave(file.path(output_dir, "figure_1_revised_with_map.png"),plot = figure_1_revised, width = 8.5, height = 11, dpi = 600, bg = "white")
+
+ggsave(file.path(output_dir, "figure_1_revised_with_map.tiff"),
+       plot = figure_1_revised, width = 8.5, height = 11, dpi = 600, compression = "lzw", bg = "white")
+
+ggsave(file.path(output_dir, "figure_1_revised_with_map.pdf"), plot = figure_1_revised, width = 8.5, height = 11, bg = "white")
+```
+
+# Reviewer comment: provide annual occupied nest counts by species
+
+Make a supplemental table showing annual occupied nest counts for each species.
+
+```{r}
+annual_nest_counts <- BS %>%
+  group_by(Year, Species) %>%
+  summarise(occupied_nests = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Species,
+              values_from = occupied_nests,
+              values_fill = 0) %>%
+  mutate(Total = BCCH + MOCH) %>%
+  arrange(Year)
+
+annual_nest_counts_total <- annual_nest_counts %>%
+  summarise(Year = "Total",
+            BCCH = sum(BCCH),
+            MOCH = sum(MOCH),
+            Total = sum(Total))
+
+annual_nest_counts_table <- bind_rows(annual_nest_counts %>% mutate(Year = as.character(Year)), annual_nest_counts_total)
+
+annual_nest_counts_table
+
+write.csv(annual_nest_counts_table,
+          file.path(output_dir, "table_annual_occupied_nests_by_species.csv"),
+          row.names = FALSE)
+```
+
+# Reviewer comment: check multicollinearity in fixed effects
+
+Check variance inflation factors for the fixed effects in the reproductive and parental-quality models.
+
+```{r}
+get_vif <- function(model_formula, data) {
+  model_data <- model.frame(model_formula, data = data, na.action = na.omit)
+  model_matrix <- model.matrix(model_formula, data = model_data)
+  model_matrix <- model_matrix[, colnames(model_matrix) != "(Intercept)", drop = FALSE]
+
+  if (ncol(model_matrix) == 1) {
+    return(data.frame(term = colnames(model_matrix), vif = 1))
+  }
+
+  data.frame(term = colnames(model_matrix),vif = sapply(seq_len(ncol(model_matrix)), function(i) {
+      predictor <- model_matrix[, i]
+      other_predictors <- model_matrix[, -i, drop = FALSE]
+      r_squared <- summary(lm(predictor ~ other_predictors))$r.squared
+      1 / (1 - r_squared)
+    }),row.names = NULL)
+}
+
+continuous_model_data <- bind_rows(
+  BS %>% filter(Species == "BCCH", !is.na(First.Egg)) %>% mutate(response = "First egg", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "MOCH", !is.na(First.Egg)) %>% mutate(response = "First egg", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "BCCH", !is.na(Egg_Number)) %>% mutate(response = "Clutch size", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "MOCH", !is.na(Egg_Number)) %>% mutate(response = "Clutch size", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "BCCH", !is.na(Nestling_Number)) %>% mutate(response = "Brood size", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "MOCH", !is.na(Nestling_Number)) %>% mutate(response = "Brood size", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "BCCH", !is.na(Avg_Nestling_Weight)) %>% mutate(response = "Average nestling mass", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "MOCH", !is.na(Avg_Nestling_Weight)) %>% mutate(response = "Average nestling mass", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "BCCH", !is.na(Female_SMI)) %>% mutate(response = "Female SMI", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "MOCH", !is.na(Female_SMI)) %>% mutate(response = "Female SMI", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "BCCH", !is.na(Male_SMI)) %>% mutate(response = "Male SMI", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "MOCH", !is.na(Male_SMI)) %>% mutate(response = "Male SMI", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "BCCH", !is.na(Provisioning)) %>% mutate(response = "Provisioning", analysis = "Continuous wing difference"),
+  BS %>% filter(Species == "MOCH", !is.na(Provisioning)) %>% mutate(response = "Provisioning", analysis = "Continuous wing difference"))
+
+continuous_vif <- continuous_model_data %>%
+  group_by(analysis, Species, response) %>%
+  group_modify(~ get_vif(~ Wing_Difference + Elevation, .x)) %>%
+  ungroup()
+
+category_model_data <- BS %>%
+  filter(Wing_Difference_Category %in% c("Slightly", "Much")) %>%
+  mutate(Wing_Difference_Category = factor(Wing_Difference_Category,
+                                           levels = c("Much", "Slightly")))
+
+category_model_data <- bind_rows(
+  category_model_data %>% filter(Species == "BCCH", !is.na(First.Egg)) %>% mutate(response = "First egg", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "MOCH", !is.na(First.Egg)) %>% mutate(response = "First egg", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "BCCH", !is.na(Egg_Number)) %>% mutate(response = "Clutch size", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "MOCH", !is.na(Egg_Number)) %>% mutate(response = "Clutch size", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "BCCH", !is.na(Nestling_Number)) %>% mutate(response = "Brood size", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "MOCH", !is.na(Nestling_Number)) %>% mutate(response = "Brood size", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "BCCH", !is.na(Avg_Nestling_Weight)) %>% mutate(response = "Average nestling mass", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "MOCH", !is.na(Avg_Nestling_Weight)) %>% mutate(response = "Average nestling mass", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "BCCH", !is.na(Female_SMI)) %>% mutate(response = "Female SMI", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "MOCH", !is.na(Female_SMI)) %>% mutate(response = "Female SMI", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "BCCH", !is.na(Male_SMI)) %>% mutate(response = "Male SMI", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "MOCH", !is.na(Male_SMI)) %>% mutate(response = "Male SMI", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "BCCH", !is.na(Provisioning)) %>% mutate(response = "Provisioning", analysis = "Categorical wing difference"),
+  category_model_data %>% filter(Species == "MOCH", !is.na(Provisioning)) %>% mutate(response = "Provisioning", analysis = "Categorical wing difference"))
+
+category_vif <- category_model_data %>%
+  group_by(analysis, Species, response) %>%
+  group_modify(~ get_vif(~ Wing_Difference_Category + Elevation, .x)) %>%
+  ungroup()
+
+vif_table <- bind_rows(continuous_vif, category_vif) %>%
+  mutate(vif = round(vif, 3)) %>%
+  arrange(analysis, Species, response, term)
+
+vif_summary <- vif_table %>%
+  group_by(analysis) %>%
+  summarise(max_vif = max(vif, na.rm = TRUE),
+            .groups = "drop")
+
+vif_table
+vif_summary
+
+write.csv(vif_table,
+          file.path(output_dir, "table_fixed_effect_vif_values.csv"),
+          row.names = FALSE)
+```
+
+# Reviewer comment: average nestling mass and brood size
+
+Check whether including brood size improves models of average nestling mass.
+
+```{r}
+get_rmse <- function(model, data, response) {
+  prediction <- predict(model, newdata = data, re.form = NA)
+  sqrt(mean((data[[response]] - prediction)^2, na.rm = TRUE))
+}
+
+nestling_mass_data <- BS %>%
+  filter(!is.na(Avg_Nestling_Weight),
+         !is.na(Nestling_Number),
+         !is.na(Wing_Difference),
+         !is.na(Elevation),
+         !is.na(Year))
+
+nestling_mass_results <- bind_rows(lapply(c("BCCH", "MOCH"), function(sp) {
+  species_data <- nestling_mass_data %>%
+    filter(Species == sp)
+
+  base_model <- lme4::lmer(Avg_Nestling_Weight ~ Wing_Difference + Elevation + (1|Year),data = species_data, REML = FALSE)
+
+  brood_model <- lme4::lmer(Avg_Nestling_Weight ~ Wing_Difference + Nestling_Number + Elevation + (1|Year), data = species_data, REML = FALSE)
+
+  interaction_model <- lme4::lmer(Avg_Nestling_Weight ~ Wing_Difference * Nestling_Number + Elevation + (1|Year),data = species_data, REML = FALSE)
+
+  aic_values <- AIC(base_model, brood_model, interaction_model) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("model")
+
+  wing_estimates <- bind_rows( data.frame(model = "base_model", wing_estimate = coef(summary(base_model))["Wing_Difference", "Estimate"]),
+    data.frame(model = "brood_model", wing_estimate = coef(summary(brood_model))["Wing_Difference", "Estimate"]),
+    data.frame(model = "interaction_model", wing_estimate = coef(summary(interaction_model))["Wing_Difference", "Estimate"]))
+
+  data.frame( Species = sp, model = c("base_model", "brood_model", "interaction_model"), n = nrow(species_data),cor_mass_brood_size = cor(species_data$Avg_Nestling_Weight,species_data$Nestling_Number),AIC = aic_values$AIC, RMSE = c(get_rmse(base_model, species_data, "Avg_Nestling_Weight"),get_rmse(brood_model, species_data, "Avg_Nestling_Weight"),get_rmse(interaction_model, species_data, "Avg_Nestling_Weight"))) %>%
+    left_join(wing_estimates, by = "model")
+}))
+
+nestling_mass_results
+
+write.csv(nestling_mass_results,file.path(output_dir,"table_average_nestling_mass_brood_size_sensitivity.csv"),row.names = FALSE)
+```
+
+# Reviewer comment: year effects and repeated pairs
+
+Run sensitivity analyses with year as a fixed effect, and then repeat those models after keeping one breeding attempt per social pair.
+
+```{r}
+get_lm_term <- function(model, term) {
+  coef_table <- coef(summary(model))
+
+  data.frame(estimate = coef_table[term, "Estimate"],
+             SE = coef_table[term, "Std. Error"],
+             test_statistic = coef_table[term, "t value"],
+             p_value = coef_table[term, "Pr(>|t|)"])
+}
+
+get_tmb_term <- function(model, term) {
+  coef_table <- coef(summary(model))$cond
+
+  data.frame(estimate = coef_table[term, "Estimate"],
+             SE = coef_table[term, "Std. Error"],
+             test_statistic = coef_table[term, "z value"],
+             p_value = coef_table[term, "Pr(>|z|)"])
+}
+
+run_fixed_year_model <- function(data, response, response_type, predictor,
+                                 term, analysis_name) {
+  model_data <- data %>%
+    filter(!is.na(.data[[response]]),
+           !is.na(.data[[predictor]]),
+           !is.na(Elevation),
+           !is.na(Year))
+
+  if (predictor == "Wing_Difference_Category") {
+    model_data <- model_data %>%
+      filter(Wing_Difference_Category %in% c("Much", "Slightly")) %>%
+      mutate(Wing_Difference_Category = factor(Wing_Difference_Category,
+                                               levels = c("Much", "Slightly")))
+  }
+
+  fixed_year_formula <- as.formula(
+    paste(response, "~", predictor, "+ Elevation + factor(Year)")
+  )
+
+  model_output <- lapply(c("BCCH", "MOCH"), function(sp) {
+    species_data <- model_data %>%
+      filter(Species == sp)
+
+    if (nrow(species_data) == 0) {
+      return(NULL)
+    }
+
+    if (response_type == "count") {
+      model <- glmmTMB::glmmTMB(fixed_year_formula, data = species_data,family = glmmTMB::compois)
+      term_results <- get_tmb_term(model, term)
+    } else {
+      model <- lm(fixed_year_formula, data = species_data)
+      term_results <- get_lm_term(model, term)
+    }
+
+    data.frame(analysis = analysis_name, response = response, Species = sp, n = nrow(species_data), term = term, term_results)
+  })
+
+  bind_rows(model_output)
+}
+
+response_models <- data.frame(
+  response = c("First.Egg",
+               "Egg_Number",
+               "Nestling_Number",
+               "Avg_Nestling_Weight",
+               "Female_SMI",
+               "Male_SMI",
+               "Provisioning"),
+  response_label = c("date of first egg",
+                     "clutch size",
+                     "brood size",
+                     "average nestling mass",
+                     "female SMI",
+                     "male SMI",
+                     "provisioning rate"),
+  response_type = c("gaussian",
+                    "count",
+                    "count",
+                    "gaussian",
+                    "gaussian",
+                    "gaussian",
+                    "gaussian")
+)
+
+fixed_year_numeric <- bind_rows(lapply(seq_len(nrow(response_models)), function(i) {
+  run_fixed_year_model(BS,response = response_models$response[i], response_type = response_models$response_type[i], predictor = "Wing_Difference",term = "Wing_Difference", analysis_name = "fixed_year_numeric")
+})) %>%
+  left_join(response_models, by = "response")
+
+fixed_year_category <- bind_rows(lapply(seq_len(nrow(response_models)), function(i) {
+  run_fixed_year_model(BS,response = response_models$response[i], response_type = response_models$response_type[i], predictor = "Wing_Difference_Category", term = "Wing_Difference_CategorySlightly", analysis_name = "fixed_year_category")
+})) %>%
+  left_join(response_models, by = "response")
+
+BS_one_pair <- BS %>%
+  arrange(Pair.ID, Year) %>%
+  group_by(Pair.ID) %>%
+  slice(1) %>%
+  ungroup()
+
+fixed_year_one_pair_numeric <- bind_rows(lapply(seq_len(nrow(response_models)), function(i) {
+  run_fixed_year_model(BS_one_pair,
+                       response = response_models$response[i],
+                       response_type = response_models$response_type[i],
+                       predictor = "Wing_Difference",
+                       term = "Wing_Difference",
+                       analysis_name = "fixed_year_numeric_one_pair")
+})) %>%
+  left_join(response_models, by = "response")
+
+fixed_year_one_pair_category <- bind_rows(lapply(seq_len(nrow(response_models)), function(i) {
+  run_fixed_year_model(BS_one_pair,
+                       response = response_models$response[i],
+                       response_type = response_models$response_type[i],
+                       predictor = "Wing_Difference_Category",
+                       term = "Wing_Difference_CategorySlightly",
+                       analysis_name = "fixed_year_category_one_pair")
+})) %>%
+  left_join(response_models, by = "response")
+
+year_pair_sensitivity <- bind_rows(fixed_year_numeric,
+                                   fixed_year_category,
+                                   fixed_year_one_pair_numeric,
+                                   fixed_year_one_pair_category) %>%
+  group_by(analysis, Species) %>%
+  mutate(p_adjusted_BH = p.adjust(p_value, method = "BH")) %>%
+  ungroup() %>%
+  select(analysis,response_label, response,Species,n, term,estimate, SE, test_statistic,  p_value, p_adjusted_BH) %>%
+  arrange(analysis, Species, response_label)
+
+repeated_pair_summary <- BS %>%
+  count(Pair.ID, Species, name = "n_breeding_attempts") %>%
+  filter(n_breeding_attempts > 1)
+
+year_pair_sensitivity
+repeated_pair_summary
+
+write.csv(year_pair_sensitivity,
+          file.path(output_dir, "table_year_fixed_effect_sensitivity.csv"),
+          row.names = FALSE)
+
+write.csv(repeated_pair_summary,
+          file.path(output_dir, "table_repeated_social_pairs.csv"),
+          row.names = FALSE)
+```
+
+# Reviewer comment: test species differences directly
+
+Run combined models with species, male-minus-female wing length, and their interaction to test whether the relationship between wing length difference and reproductive or parental-quality traits differs between species.
+
+```{r}
+get_species_interaction_lm <- function(model) {
+  coef_table <- coef(summary(model))
+  term <- "Wing_Difference:SpeciesMOCH"
+
+  data.frame(estimate = coef_table[term, "Estimate"],
+             SE = coef_table[term, "Std. Error"],
+             test_statistic = coef_table[term, "t value"],
+             p_value = coef_table[term, "Pr(>|t|)"])
+}
+
+get_species_interaction_tmb <- function(model) {
+  coef_table <- coef(summary(model))$cond
+  term <- "Wing_Difference:SpeciesMOCH"
+
+  data.frame(estimate = coef_table[term, "Estimate"],
+             SE = coef_table[term, "Std. Error"],
+             test_statistic = coef_table[term, "z value"],
+             p_value = coef_table[term, "Pr(>|z|)"])
+}
+
+run_species_interaction_model <- function(data, response, response_type) {
+  model_data <- data %>%
+    filter(!is.na(.data[[response]]),
+           !is.na(Wing_Difference),
+           !is.na(Species),
+           !is.na(Elevation),
+           !is.na(Year)) %>%
+    mutate(Species = factor(Species, levels = c("BCCH", "MOCH")))
+
+  model_formula <- as.formula(
+    paste(response, "~ Wing_Difference * Species + Elevation + factor(Year)")
+  )
+
+  if (response_type == "count") {
+    model <- glmmTMB::glmmTMB(model_formula,
+                              data = model_data,
+                              family = glmmTMB::compois)
+    term_results <- get_species_interaction_tmb(model)
+  } else {
+    model <- lm(model_formula, data = model_data)
+    term_results <- get_species_interaction_lm(model)
+  }
+
+  species_slopes <- bind_rows(lapply(c("BCCH", "MOCH"), function(sp) {
+    species_data <- model_data %>%
+      filter(Species == sp)
+
+    species_formula <- as.formula( paste(response, "~ Wing_Difference + Elevation + factor(Year)"))
+
+    if (response_type == "count") {
+      species_model <- glmmTMB::glmmTMB(species_formula,
+                                        data = species_data,
+                                        family = glmmTMB::compois)
+      coef_table <- coef(summary(species_model))$cond
+      slope <- data.frame(estimate = coef_table["Wing_Difference", "Estimate"],
+                          SE = coef_table["Wing_Difference", "Std. Error"],
+                          p_value = coef_table["Wing_Difference", "Pr(>|z|)"])
+    } else {
+      species_model <- lm(species_formula, data = species_data)
+      coef_table <- coef(summary(species_model))
+      slope <- data.frame(estimate = coef_table["Wing_Difference", "Estimate"],
+                          SE = coef_table["Wing_Difference", "Std. Error"],
+                          p_value = coef_table["Wing_Difference", "Pr(>|t|)"])
+    }
+
+    data.frame(Species = sp,n = nrow(species_data), slope_estimate = slope$estimate,slope_SE = slope$SE,
+               slope_p_value = slope$p_value)
+  }))
+
+  data.frame(response = response,
+             n_total = nrow(model_data),
+             interaction_term = "Wing_Difference:SpeciesMOCH",
+             interaction_estimate = term_results$estimate,
+             interaction_SE = term_results$SE,
+             interaction_test_statistic = term_results$test_statistic,
+             interaction_p_value = term_results$p_value) %>%
+    tidyr::crossing(species_slopes)
+}
+
+species_interaction_results <- bind_rows(lapply(seq_len(nrow(response_models)), function(i) {
+  run_species_interaction_model(BS,
+                                response = response_models$response[i],
+                                response_type = response_models$response_type[i])
+})) %>%
+  left_join(response_models, by = "response") %>%
+  group_by(Species) %>%
+  mutate(slope_p_adjusted_BH = p.adjust(slope_p_value, method = "BH")) %>%
+  ungroup() %>%
+  mutate(interaction_p_adjusted_BH = p.adjust(interaction_p_value, method = "BH")) %>%
+  select(response_label, response,  n_total, Species,  n, slope_estimate, slope_SE, slope_p_value,  slope_p_adjusted_BH,interaction_term,interaction_estimate, interaction_SE, interaction_test_statistic,interaction_p_value,interaction_p_adjusted_BH) %>%
+  arrange(response_label, Species)
+
+species_interaction_summary <- species_interaction_results %>%
+  distinct(response_label,
+           response,
+           n_total,
+           interaction_estimate,
+           interaction_SE,
+           interaction_test_statistic,
+           interaction_p_value,
+           interaction_p_adjusted_BH) %>%
+  arrange(interaction_p_value)
+
+species_interaction_results
+species_interaction_summary
+
+write.csv(species_interaction_results,
+          file.path(output_dir, "table_species_interaction_models.csv"),
+          row.names = FALSE)
+
+write.csv(species_interaction_summary,
+          file.path(output_dir, "table_species_interaction_summary.csv"),
+          row.names = FALSE)
+```
+
+# Reviewer comment: model diagnostics for final reproductive models
+
+Check diagnostics for the final combined species-by-wing-difference models.
+
+```{r}
+get_model_diagnostics <- function(data, response, response_type) {
+  model_data <- data %>%
+    filter(!is.na(.data[[response]]),
+           !is.na(Wing_Difference),
+           !is.na(Species),
+           !is.na(Elevation),
+           !is.na(Year)) %>%
+    mutate(Species = factor(Species, levels = c("BCCH", "MOCH")))
+
+  model_formula <- as.formula(paste(response, "~ Wing_Difference * Species + Elevation + factor(Year)"))
+
+  if (response_type == "count") {
+    model <- glmmTMB::glmmTMB(model_formula,
+                              data = model_data,
+                              family = glmmTMB::compois)
+    residuals_sim <- DHARMa::simulateResiduals(model, plot = FALSE)
+
+    data.frame(n = nrow(model_data), convergence = model$fit$convergence,
+               positive_definite_hessian = model$sdr$pdHess,
+               uniformity_p = DHARMa::testUniformity(residuals_sim,
+                                                     plot = FALSE)$p.value,
+               dispersion_p = DHARMa::testDispersion(residuals_sim,
+                                                     plot = FALSE)$p.value,
+               outlier_p = DHARMa::testOutliers(residuals_sim,
+                                                plot = FALSE)$p.value)
+  } else {
+    model <- lm(model_formula, data = model_data)
+
+    data.frame(n = nrow(model_data), convergence = NA, positive_definite_hessian = NA, uniformity_p = NA, dispersion_p = NA, outlier_p = NA)
+  }
+}
+
+final_model_diagnostics <- bind_rows(lapply(seq_len(nrow(response_models)), function(i) {
+  get_model_diagnostics(BS, response = response_models$response[i], response_type = response_models$response_type[i]) %>%
+    mutate(response = response_models$response[i],
+           response_label = response_models$response_label[i],
+           response_type = response_models$response_type[i])
+})) %>%
+  select(response_label, response, response_type, n, convergence, positive_definite_hessian, uniformity_p, dispersion_p, outlier_p)
+
+final_model_diagnostics
+
+write.csv(final_model_diagnostics, file.path(output_dir, "table_final_model_diagnostics.csv"),row.names = FALSE)
+```
+
+# Reviewer comment: revise Figure 3
+
+Remake Figure 3 using the combined species-by-wing-difference models. Confidence intervals are shown with lines instead of shaded ribbons.
+
+```{r}
+figure3_responses <- data.frame(
+  response = c("First.Egg", "Egg_Number", "Nestling_Number", "Avg_Nestling_Weight", "Female_SMI","Male_SMI", "Provisioning"),
+  response_label = c("Date of first egg", "Clutch size","Brood size", "Avg. nestling mass (g)","Female SMI", "Male SMI","Provisioning rate"),
+  response_type = c("gaussian", "count","count", "gaussian", "gaussian", "gaussian","gaussian"))
+
+species_colors <- c("BCCH" = "#0072B2",
+                    "MOCH" = "#CC79A7")
+
+get_common_year <- function(data) {
+  names(sort(table(data$Year), decreasing = TRUE))[1] %>%
+    as.numeric()
+}
+
+make_prediction_data <- function(data, response) {
+  model_data <- data %>%
+    filter(!is.na(.data[[response]]),
+           !is.na(Wing_Difference),
+           !is.na(Species),
+           !is.na(Elevation),
+           !is.na(Year)) %>%
+    mutate(Species = factor(Species, levels = c("BCCH", "MOCH")))
+
+  pred_grid <- expand_grid(
+    Wing_Difference = seq(min(model_data$Wing_Difference, na.rm = TRUE),
+                          max(model_data$Wing_Difference, na.rm = TRUE),
+                          length.out = 100),
+    Species = factor(c("BCCH", "MOCH"), levels = c("BCCH", "MOCH"))) %>%
+    mutate(Elevation = median(model_data$Elevation, na.rm = TRUE),
+           Year = get_common_year(model_data))
+
+  list(model_data = model_data,
+       pred_grid = pred_grid)
+}
+
+fit_interaction_model_for_plot <- function(model_data, response, response_type) {
+  model_formula <- as.formula(paste(response, "~ Wing_Difference * Species + Elevation + factor(Year)"))
+
+  if (response_type == "count") {
+    glmmTMB::glmmTMB(model_formula,
+                     data = model_data,
+                     family = glmmTMB::compois)
+  } else {
+    lm(model_formula, data = model_data)
+  }
+}
+
+predict_interaction_model <- function(model, pred_grid, response_type) {
+  if (response_type == "count") {
+    pred <- predict(model, newdata = pred_grid,  type = "link", se.fit = TRUE)
+
+    pred_grid %>%
+      mutate(predicted = exp(pred$fit),
+             conf.low = exp(pred$fit - 1.96 * pred$se.fit),
+             conf.high = exp(pred$fit + 1.96 * pred$se.fit))
+  } else {
+    pred <- predict(model,
+                    newdata = pred_grid,
+                    se.fit = TRUE)
+
+    pred_grid %>%
+      mutate(predicted = pred$fit,
+             conf.low = pred$fit - 1.96 * pred$se.fit,
+             conf.high = pred$fit + 1.96 * pred$se.fit)
+  }
+}
+
+make_figure3_panel <- function(data, response, response_label, response_type) {
+  plot_data <- make_prediction_data(data, response)
+  model <- fit_interaction_model_for_plot(plot_data$model_data,
+                                          response,
+                                          response_type)
+  predictions <- predict_interaction_model(model,
+                                           plot_data$pred_grid,
+                                           response_type)
+
+  ggplot() +
+    geom_point(data = plot_data$model_data,
+               aes(x = Wing_Difference,
+                   y = .data[[response]],
+                   fill = Species),
+               shape = 21,
+               color = "black",
+               stroke = 0.25,
+               size = 1.4,
+               alpha = 0.55,
+               position = position_jitter(width = 0.08, height = 0)) +
+    geom_line(data = predictions,
+              aes(x = Wing_Difference,
+                  y = predicted,
+                  color = Species),
+              linewidth = 0.85) +
+    geom_line(data = predictions,
+              aes(x = Wing_Difference,
+                  y = conf.low,
+                  color = Species),
+              linewidth = 0.35,
+              linetype = "dashed",
+              alpha = 0.85) +
+    geom_line(data = predictions,
+              aes(x = Wing_Difference,
+                  y = conf.high,
+                  color = Species),
+              linewidth = 0.35,
+              linetype = "dashed",
+              alpha = 0.85) +
+    scale_fill_manual(values = species_colors) +
+    scale_color_manual(values = species_colors) +
+    labs(x = "Male-minus-female wing length (mm)",
+         y = response_label) +
+    theme_classic(base_size = 9) +
+    theme(legend.position = "bottom",
+          legend.title = element_blank(),
+          axis.title = element_text(size = 9),
+          axis.text = element_text(size = 8),
+          plot.margin = margin(4, 4, 4, 4))
+}
+
+figure3_panels <- lapply(seq_len(nrow(figure3_responses)), function(i) {
+  make_figure3_panel(BS,
+                     response = figure3_responses$response[i],
+                     response_label = figure3_responses$response_label[i],
+                     response_type = figure3_responses$response_type[i])
+})
+
+figure3_panels <- lapply(seq_along(figure3_panels), function(i) {
+  if (i %in% c(5, 6, 7)) {
+    figure3_panels[[i]]
+  } else {
+    figure3_panels[[i]] +
+      theme(axis.title.x = element_blank())
+  }
+})
+
+figure3_panels <- lapply(figure3_panels, function(x) {
+  x + theme(legend.position = "none")
+})
+
+figure3_legend_panel <- ggplot() +
+  annotate("segment",
+           x = 0.08,
+           xend = 0.28,
+           y = 0.78,
+           yend = 0.78,
+           color = species_colors["BCCH"],
+           linewidth = 1.5) +
+  annotate("point",
+           x = 0.18,
+           y = 0.78,
+           fill = species_colors["BCCH"],
+           color = "black",
+           shape = 21,
+           size = 4.2,
+           stroke = 0.45) +
+  annotate("text",
+           x = 0.34,
+           y = 0.78,
+           label = "BCCH",
+           hjust = 0,
+           size = 6) +
+  annotate("segment",
+           x = 0.08,
+           xend = 0.28,
+           y = 0.22,
+           yend = 0.22,
+           color = species_colors["MOCH"],
+           linewidth = 1.5) +
+  annotate("point",
+           x = 0.18,
+           y = 0.22,
+           fill = species_colors["MOCH"],
+           color = "black",
+           shape = 21,
+           size = 4.2,
+           stroke = 0.45) +
+  annotate("text",
+           x = 0.34,
+           y = 0.22,
+           label = "MOCH",
+           hjust = 0,
+           size = 6) +
+  coord_cartesian(xlim = c(0, 1),
+                  ylim = c(0, 1),
+                  clip = "off") +
+  theme_void() +
+  theme(plot.margin = margin(12, 12, 12, 12))
+
+figure3_top <- cowplot::plot_grid(plotlist = figure3_panels[1:6],
+                                  labels = LETTERS[1:6],
+                                  ncol = 3,
+                                  align = "hv")
+
+figure3_bottom <- cowplot::plot_grid(figure3_panels[[7]],
+                                     figure3_legend_panel,
+                                     labels = c("G", ""),
+                                     ncol = 2,
+                                     rel_widths = c(1, 2),
+                                     align = "h")
+
+figure3_revised <- cowplot::plot_grid(figure3_top,
+                                      figure3_bottom,
+                                      ncol = 1,
+                                      rel_heights = c(2, 1))
+
+figure3_revised
+
+ggsave(file.path(output_dir, "figure_3_species_interactions.png"),
+       plot = figure3_revised,
+       width = 8.5,
+       height = 7,
+       dpi = 600,
+       bg = "white")
+
+ggsave(file.path(output_dir, "figure_3_species_interaction.pdf"),
+       plot = figure3_revised,
+       width = 8.5,
+       height = 7,
+       bg = "white")
+
+ggsave(file.path(output_dir, "figure_3_species_interaction.tiff"),
+       plot = figure3_revised,
+       width = 8.5,
+       height = 7,
+       dpi = 600,
+       bg = "white",
+       compression = "lzw")
+```
+
