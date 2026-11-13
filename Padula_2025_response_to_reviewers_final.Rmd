@@ -1,0 +1,749 @@
+---
+title: "Padula_2025_response_to_reviewers_analysis"
+author: "Sara Padula"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+library(lmerTest)
+library(glmmTMB)
+library(DHARMa)
+library(sandwich)
+```
+
+## Load data
+
+```{r data}
+# Use the corrected CSVs from the manuscript analyses. Keep the original row order.
+paired_path <- "paired_corrected.csv"  # path to dataset
+population_path <- "population_corrected.csv"  # path to dataset
+sex_audit_path <- "sex_assignment_audit.csv"  # path to dataset
+BS <- read.csv(paired_path)
+BSpop <- read.csv(population_path)
+sex_audit <- read.csv(sex_audit_path)
+inferred_ids <- sex_audit$ID[grepl("Inferred opposite role", sex_audit$assignment_source)]
+output_dir <- "reviewer_response_results"
+dir.create(output_dir, showWarnings = FALSE)
+dir.create(file.path(output_dir, "figures"), showWarnings = FALSE)
+BS$Species <- factor(BS$Species, levels = c("BCCH", "MOCH"))
+BS$Year <- as.integer(BS$Year)
+BS$Wing_Difference <- BS$Male.Wing.Chord - BS$Female.Wing.Chord
+BSpopI <- BSpop %>%
+  arrange(Year, .row) %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  mutate(Sex = factor(Sex, levels = c("F", "M")), Species = factor(Species, levels = c("BCCH",
+    "MOCH")), Bander = factor(Bander))
+responses <- c("First.Egg", "Egg_Number", "Nestling_Number", "Avg_Nestling_Weight", "Female_SMI",
+  "Male_SMI", "Provisioning")
+count_responses <- c("Egg_Number", "Nestling_Number")
+wing_center <- mean(BS$Wing_Difference)
+BS$x <- BS$Wing_Difference - wing_center
+BS$q <- BS$x^2
+thresholds <- tapply(BS$Wing_Difference[BS$Wing_Difference > 0], BS$Species[BS$Wing_Difference >
+  0], median)
+# The median goes in the slightly larger group for MOCH and the much larger group for
+# BCCH.
+slightly_larger <- with(BS, ifelse(Species == "MOCH", Wing_Difference <= thresholds["MOCH"],
+  Wing_Difference < thresholds["BCCH"]))
+BS$Wing_Difference_Category <- with(BS, ifelse(Wing_Difference <= 0, NA, ifelse(slightly_larger,
+  "Slightly", "Much")))
+BS$Elevation_km <- (BS$Elevation - 2000)/1000
+```
+
+## Calculate scaled mass index
+
+```{r smi}
+# Estimate the SMA exponent and mean wing length separately for each species and sex. Use
+# the first complete capture by year, with source order breaking ties.
+calibration <- BSpop %>%
+  filter(is.finite(Wing.Chord), Wing.Chord > 0, is.finite(Mass), Mass > 0) %>%
+  arrange(Year, .row) %>%
+  distinct(ID, .keep_all = TRUE)
+smi_parameters <- calibration %>%
+  group_by(Species, Sex) %>%
+  summarise(n = n(), reference_wing = mean(Wing.Chord), cor_log = cor(log(Mass), log(Wing.Chord)),
+    exponent = sign(cor(log(Mass), log(Wing.Chord))) * sd(log(Mass))/sd(log(Wing.Chord)),
+    .groups = "drop")
+stopifnot(nrow(smi_parameters) == 4, all(is.finite(smi_parameters$exponent)))
+for (sex in c("Female", "Male")) {
+  parameters <- filter(smi_parameters, Sex == substr(sex, 1, 1))
+  i <- match(BS$Species, parameters$Species)
+  wing <- BS[[paste0(sex, ".Wing.Chord")]]
+  mass <- BS[[paste0(sex, ".Weight")]]
+  BS[[paste0(sex, "_SMI")]] <- mass * (parameters$reference_wing[i]/wing)^parameters$exponent[i]
+}
+write.csv(smi_parameters, file.path(output_dir, "SMI_parameters.csv"), row.names = FALSE)
+smi_parameters
+```
+
+## Sample sizes and repeated parents and pairs (Table S1)
+
+```{r sampling}
+annual <- BS %>%
+  count(Year, Species, name = "attempts") %>%
+  pivot_wider(names_from = Species, values_from = attempts, values_fill = 0) %>%
+  mutate(Total = BCCH + MOCH)
+lineage <- BS %>%
+  group_by(Location, Species, Year) %>%
+  summarise(attempts = n(), pairs = n_distinct(Pair.ID), males = n_distinct(Male.ID), females = n_distinct(Female.ID),
+    elevation_mean = mean(Elevation), elevation_min = min(Elevation), elevation_max = max(Elevation),
+    .groups = "drop")
+sample_rows <- list()
+for (y in responses) {
+  for (sp in c("BCCH", "MOCH")) {
+    ss <- BS[BS$Species == sp & complete.cases(BS[c(y, "Wing_Difference", "Elevation_km",
+      "Year")]), ]
+    sample_rows[[paste(y, sp)]] <- data.frame(response = y, Species = sp, n = nrow(ss),
+      unique_males = n_distinct(ss$Male.ID), unique_females = n_distinct(ss$Female.ID),
+      unique_ordered_pairs = n_distinct(ss$Pair.ID), unique_unordered_pairs = n_distinct(ss$.canonical_pair),
+      years = paste(sort(unique(ss$Year)), collapse = ", "))
+  }
+}
+samples <- bind_rows(sample_rows)
+paired_descriptives <- BS %>%
+  group_by(Species) %>%
+  summarise(attempts = n(), pairs = n_distinct(Pair.ID), males = n_distinct(Male.ID), females = n_distinct(Female.ID),
+    wingdiff_min = min(Wing_Difference), wingdiff_max = max(Wing_Difference), mean_wing = mean(Avg.Wing),
+    .groups = "drop")
+repeated_pairs <- BS %>%
+  count(Species, .canonical_pair, name = "n_attempts") %>%
+  filter(n_attempts > 1)
+repeated_individuals <- bind_rows(lapply(c("Male", "Female"), function(sex) {
+  BS %>%
+    group_by(Species, ID = .data[[paste0(sex, ".ID")]]) %>%
+    summarise(n_attempts = n(), years = paste(sort(unique(Year)), collapse = ", "), .groups = "drop") %>%
+    filter(n_attempts > 1) %>%
+    mutate(Sex = sex)
+}))
+write.csv(annual, file.path(output_dir, "annual_sampled_attempts.csv"), row.names = FALSE)
+write.csv(lineage, file.path(output_dir, "site_year_sample_lineage.csv"), row.names = FALSE)
+write.csv(samples, file.path(output_dir, "analysis_sample_structure.csv"), row.names = FALSE)
+write.csv(paired_descriptives, file.path(output_dir, "paired_descriptives.csv"), row.names = FALSE)
+write.csv(repeated_pairs, file.path(output_dir, "canonical_repeated_pairs.csv"), row.names = FALSE)
+write.csv(repeated_individuals, file.path(output_dir, "repeated_individuals.csv"), row.names = FALSE)
+annual
+samples
+repeated_pairs
+```
+
+## Wing length differences and mate wing lengths (Table S2)
+
+```{r dimorphism}
+mods <- list(population_dimorphism = lmerTest::lmer(Wing.Chord ~ Sex * Species + (1 | Bander),
+  BSpopI), pair_dimorphism = lmerTest::lmer(Wing_Difference ~ Species + (1 | Year), BS),
+  MOCH_pairing = lmerTest::lmer(Male.Wing.Chord ~ Female.Wing.Chord + (1 | Year), BS[BS$Species ==
+    "MOCH", ]), BCCH_pairing = lmerTest::lmer(Male.Wing.Chord ~ Female.Wing.Chord + (1 |
+    Year), BS[BS$Species == "BCCH", ]))
+cf <- list()
+rv <- list()
+for (nm in names(mods)) {
+  f <- mods[[nm]]
+  ct <- coef(summary(f))
+  cr <- qt(0.975, ct[, "df"])
+  cf[[nm]] <- data.frame(model = nm, n = nobs(f), term = rownames(ct), estimate = ct[, 1],
+    SE = ct[, 2], df = ct[, 3], statistic = ct[, 4], p = ct[, 5], CI_low = ct[, 1] - cr *
+      ct[, 2], CI_high = ct[, 1] + cr * ct[, 2], row.names = NULL)
+  rv[[nm]] <- data.frame(model = nm, as.data.frame(lme4::VarCorr(f)), singular = lme4::isSingular(f))
+}
+write.csv(bind_rows(cf), file.path(output_dir, "dimorphism_pairing_full_models.csv"), row.names = FALSE)
+write.csv(bind_rows(rv), file.path(output_dir, "dimorphism_pairing_variances.csv"), row.names = FALSE)
+summary(mods$population_dimorphism)
+summary(mods$pair_dimorphism)
+summary(mods$MOCH_pairing)
+summary(mods$BCCH_pairing)
+# Check the random terms removed from the preliminary SSD models.
+preliminary <- list(population_year = lmerTest::lmer(Wing.Chord ~ Sex * Species + (1 | Bander) +
+  (1 | Year), BSpopI), pair_banders = lmerTest::lmer(Wing_Difference ~ Species + (1 | Year) +
+  (1 | MaleBander) + (1 | FemaleBander), BS))
+preliminary_variances <- bind_rows(lapply(names(preliminary), function(nm) {
+  data.frame(model = nm, as.data.frame(VarCorr(preliminary[[nm]])), singular = isSingular(preliminary[[nm]]))
+}))
+write.csv(preliminary_variances, file.path(output_dir, "preliminary_SSD_variances.csv"), row.names = FALSE)
+# Sex contrasts for each species, using Satterthwaite degrees of freedom.
+contrasts <- list()
+for (sp in c("BCCH", "MOCH")) {
+  L <- if (sp == "BCCH")
+    c(0, 1, 0, 0) else c(0, 1, 0, 1)
+  contrasts[[paste(sp, "population")]] <- data.frame(Species = sp, contrast = "population_sex_difference",
+    contest1D(mods$population_dimorphism, L, confint = TRUE), check.names = FALSE)
+  L <- if (sp == "BCCH")
+    c(1, 0) else c(1, 1)
+  contrasts[[paste(sp, "pair")]] <- data.frame(Species = sp, contrast = "within_pair_difference",
+    contest1D(mods$pair_dimorphism, L, confint = TRUE), check.names = FALSE)
+}
+sex_contrasts <- bind_rows(contrasts)
+population_descriptives <- BSpopI %>%
+  group_by(Species, Sex) %>%
+  summarise(n = n(), mean_wing = mean(Wing.Chord), sd_wing = sd(Wing.Chord), .groups = "drop")
+pearson <- bind_rows(lapply(c("BCCH", "MOCH"), function(sp) {
+  ss <- BS[BS$Species == sp, ]
+  cc <- cor.test(ss$Female.Wing.Chord, ss$Male.Wing.Chord)
+  data.frame(Species = sp, n = nrow(ss), r = unname(cc$estimate), CI_low = cc$conf.int[1],
+    CI_high = cc$conf.int[2], p = cc$p.value)
+}))
+write.csv(sex_contrasts, file.path(output_dir, "verified_descriptive_contrasts.csv"), row.names = FALSE)
+write.csv(population_descriptives, file.path(output_dir, "population_wing_descriptives.csv"),
+  row.names = FALSE)
+write.csv(pearson, file.path(output_dir, "pearson_correlations.csv"), row.names = FALSE)
+sex_contrasts
+pearson
+```
+
+## Does wing length vary with elevation?
+
+```{r elevation}
+elevation_models <- list()
+elevation_results <- list()
+for (sp in c("BCCH", "MOCH")) {
+  for (sex in c("F", "M")) {
+    ss <- BSpopI[BSpopI$Species == sp & BSpopI$Sex == sex & complete.cases(BSpopI[c("Wing.Chord",
+      "Elevation", "Year")]), ]
+    ss$Elevation_km <- (ss$Elevation - 2000)/1000
+    fit <- lmerTest::lmer(Wing.Chord ~ Elevation_km + (1 | Year), ss)
+    cc <- coef(summary(fit))["Elevation_km", ]
+    critical <- qt(0.975, cc["df"])
+    elevation_models[[paste(sp, sex)]] <- fit
+    elevation_results[[paste(sp, sex)]] <- data.frame(Species = sp, Sex = sex, n = nobs(fit),
+      estimate = cc[1], SE = cc[2], df = cc[3], statistic = cc[4], p = cc[5], CI_low = cc[1] -
+        critical * cc[2], CI_high = cc[1] + critical * cc[2], year_variance = as.data.frame(VarCorr(fit))$vcov[1],
+      singular = isSingular(fit))
+  }
+}
+elevation_results <- bind_rows(elevation_results)
+write.csv(elevation_results, file.path(output_dir, "elevation_wing_sensitivity.csv"), row.names = FALSE)
+elevation_results
+```
+
+## Observed and random pairings (Table S15)
+
+```{r random_pairing}
+permutation <- list()
+permutation_draws <- list()
+B <- 10000L
+for (sp in c("MOCH", "BCCH")) {
+  ss <- BS[BS$Species == sp & complete.cases(BS[c("Male.Wing.Chord", "Female.Wing.Chord")]),
+    ]
+  delta <- ss$Male.Wing.Chord - ss$Female.Wing.Chord
+  threshold <- median(delta[delta > 0])
+  set.seed(if (sp == "MOCH")
+    26 else 27)
+  for (cat in c("Female-larger", "Male-slightly-larger", "Male-much-larger")) {
+    s <- if (cat == "Female-larger")
+      ss else ss[delta > 0, ]
+    wd <- s$Male.Wing.Chord - s$Female.Wing.Chord
+    slight <- function(x) if (sp == "MOCH")
+      x > 0 & x <= threshold else x > 0 & x < threshold
+    much <- function(x) if (sp == "MOCH")
+      x > threshold else x >= threshold
+    observed <- if (cat == "Female-larger")
+      sum(wd < 0) else if (cat == "Male-slightly-larger")
+      sum(slight(wd)) else sum(much(wd))
+    obs_prop <- observed/nrow(s)
+    null <- if (cat == "Male-much-larger")
+      1 - null_slight else replicate(B, {
+      z <- sample(s$Male.Wing.Chord) - sample(s$Female.Wing.Chord)
+      if (cat == "Female-larger")
+        mean(z < 0) else if (cat == "Male-slightly-larger")
+        sum(slight(z))/sum(z > 0) else sum(much(z))/sum(z > 0)
+    })
+    if (cat == "Male-slightly-larger")
+      null_slight <- null
+    permutation_draws[[paste(sp, cat)]] <- data.frame(Species = sp, category = cat, iteration = seq_len(B),
+      proportion = null)
+    lower <- (1 + sum(null <= obs_prop + 1e-12))/(B + 1)
+    upper <- (1 + sum(null >= obs_prop - 1e-12))/(B + 1)
+    permutation[[paste(sp, cat)]] <- data.frame(Species = sp, category = cat, threshold,
+      observed_n = observed, denominator = nrow(s), observed_prop = obs_prop, null_mean = mean(null),
+      null_low = unname(quantile(null, 0.025)), null_high = unname(quantile(null, 0.975)),
+      p_lower = lower, p_upper = upper, p_directional = if (cat == "Male-slightly-larger")
+        upper else lower, iterations = B)
+  }
+}
+write.csv(bind_rows(permutation_draws), file.path(output_dir, "randomization_draws.csv"), row.names = FALSE)
+randomization_results <- bind_rows(permutation)
+randomization_results$MC_SE <- with(randomization_results, sqrt(p_directional * (1 - p_directional)/(iterations +
+  1)))
+null_draws <- bind_rows(permutation_draws)
+write.csv(randomization_results, file.path(output_dir, "Table_S15_random_pairing.csv"), row.names = FALSE)
+randomization_results
+```
+
+## Plot observed and random pairings (Figure 2)
+
+```{r pairing_plot}
+species_colors <- c(BCCH = "#0072B2", MOCH = "#CC79A7")
+# Figure 2: observed wing differences and random pairings.
+dens <- list()
+histograms <- list()
+for (sp in c("MOCH", "BCCH")) {
+  dd <- BS[BS$Species == sp, ]
+  cut <- thresholds[[sp]]
+  ymax <- max(density(dd$Wing_Difference)$y) * 1.05
+  dens[[sp]] <- ggplot(dd, aes(Wing_Difference)) + geom_density(fill = species_colors[sp],
+    alpha = 0.5, linewidth = 0.3) + geom_vline(xintercept = 0, linewidth = 0.4) + geom_vline(xintercept = cut,
+    linetype = "dashed", linewidth = 0.6) + annotate("text", x = -2.4, y = ymax * 0.5,
+    label = "Female larger", size = 3.4) + annotate("text", x = cut/2, y = ymax * 0.5,
+    label = "Male slightly\nlarger", size = 3.4) + annotate("text", x = cut + 2.1, y = ymax *
+    0.5, label = "Male much\nlarger", size = 3.4) + scale_x_continuous(limits = c(-7, 12.2),
+    breaks = seq(-6, 12, 2), expand = expansion(mult = 0)) + coord_cartesian(xlim = c(-7,
+    12.2), ylim = c(0, ymax), expand = FALSE) + theme_classic(base_size = 10) + theme(panel.border = element_rect(color = "black",
+    fill = NA, linewidth = 0.35), axis.title.y = element_text(face = "bold"), plot.margin = margin(2,
+    5, 2, 2)) + labs(x = if (sp == "BCCH")
+    "Difference Between Male and Female Wing Chord (mm)" else NULL, y = "Density")
+  for (cat in c("Female-larger", "Male-slightly-larger", "Male-much-larger")) {
+    nn <- null_draws[null_draws$Species == sp & null_draws$category == cat, ]
+    tt <- randomization_results[randomization_results$Species == sp & randomization_results$category ==
+      cat, ]
+    obs <- 100 * tt$observed_prop
+    label <- switch(cat, `Female-larger` = "Percent female larger\npairings", `Male-slightly-larger` = "Percent male slightly\nlarger pairings",
+      `Male-much-larger` = "Percent male much\nlarger pairings")
+    pp <- ggplot(nn, aes(proportion * 100)) + geom_histogram(bins = 10, fill = species_colors[sp],
+      color = "black", alpha = if (sp == "BCCH")
+        0.8 else 1, linewidth = 0.3) + geom_vline(xintercept = obs, color = "black", linewidth = 1.8) +
+      geom_vline(xintercept = obs, color = "#ADD8E6", linewidth = 1) + theme_cowplot() +
+      labs(x = if (sp == "BCCH")
+        label else NULL, y = "Count") + theme(axis.title = element_text(size = 10), axis.text = element_text(size = 9),
+      plot.margin = margin(3, 7, 3, 3))
+    sig <- if (tt$p_directional < 0.001)
+      "***" else if (tt$p_directional < 0.01)
+      "**" else if (tt$p_directional < 0.05)
+      "*" else ""
+    if (nchar(sig))
+      pp <- pp + annotate("text", x = Inf, y = Inf, label = sig, hjust = 1.8, vjust = 1.1,
+        size = 8)
+    histograms[[paste(sp, cat)]] <- pp
+  }
+}
+hm <- plot_grid(plotlist = histograms[1:3], ncol = 3, align = "h")
+hb <- plot_grid(plotlist = histograms[4:6], ncol = 3, align = "h")
+f2 <- ggdraw() + draw_plot(dens$MOCH, x = 0.075, y = 0.785, width = 0.925, height = 0.17) +
+  draw_plot(dens$BCCH, x = 0.075, y = 0.53, width = 0.925, height = 0.2) + draw_plot(hm,
+  x = 0.075, y = 0.325, width = 0.925, height = 0.18) + draw_plot(hb, x = 0.075, y = 0.035,
+  width = 0.925, height = 0.24) + draw_plot_label(c("a)", "b)", "c)", "d)"), x = 0.03, y = c(0.9,
+  0.65, 0.435, 0.215), hjust = 0, vjust = 1, size = 13, fontface = "plain")
+ggsave(file.path(output_dir, "figures", "Figure_2.png"), f2, width = 10, height = 6.38, dpi = 600,
+  bg = "white")
+```
+
+## Functions for the reproductive models
+
+```{r model_functions}
+# Joint tests use both wing difference terms from the same model.  BCCH is the reference
+# species. For MOCH, add the interaction to each main term.
+coefficient_table <- function(f) {
+  if (inherits(f, "glmmTMB")) {
+    c <- coef(summary(f))$cond
+    df <- rep(Inf, nrow(c))
+  } else if (inherits(f, "merMod")) {
+    c <- coef(summary(f))
+    df <- c[, "df"]
+  } else {
+    c <- coef(summary(f))
+    df <- rep(df.residual(f), nrow(c))
+  }
+  crit <- qt(0.975, df)
+  data.frame(term = rownames(c), estimate = c[, 1], SE = c[, 2], CI_low = c[, 1] - crit *
+    c[, 2], CI_high = c[, 1] + crit * c[, 2], statistic = c[, if (inherits(f, "merMod"))
+    "t value" else 3], df = df, p = c[, ncol(c)], row.names = NULL)
+}
+fixed_estimates <- function(f) if (inherits(f, "glmmTMB")) fixef(f)$cond else if (inherits(f,
+  "merMod")) fixef(f) else coef(f)
+fixed_covariance <- function(f) if (inherits(f, "glmmTMB")) as.matrix(vcov(f)$cond) else as.matrix(vcov(f))
+joint_test <- function(f, L, V = NULL) {
+  b <- fixed_estimates(f)
+  L <- as.matrix(L)
+  L <- L[, names(b), drop = FALSE]
+  if (is.null(V))
+    V <- fixed_covariance(f)
+  est <- as.numeric(L %*% b)
+  cv <- L %*% V %*% t(L)
+  r <- qr(L)$rank
+  W <- as.numeric(t(est) %*% solve(cv, est))
+  if (inherits(f, "merMod")) {
+    c <- lmerTest::contestMD(f, L, ddf = "Satterthwaite")
+    return(data.frame(test = "F Satterthwaite", statistic = c[["F value"]], df1 = c[["NumDF"]],
+      df2 = c[["DenDF"]], p = c[["Pr(>F)"]]))
+  }
+  if (inherits(f, "lm"))
+    return(data.frame(test = "F", statistic = W/r, df1 = r, df2 = df.residual(f), p = pf(W/r,
+      r, df.residual(f), lower.tail = FALSE)))
+  data.frame(test = "Wald chi-square", statistic = W, df1 = r, df2 = NA_real_, p = pchisq(W,
+    r, lower.tail = FALSE))
+}
+test_contrast <- function(f, target, category = FALSE) {
+  b <- fixed_estimates(f)
+  z <- matrix(0, nrow = if (category)
+    1 else 2, ncol = length(b), dimnames = list(NULL, names(b)))
+  a <- if (category)
+    "categorySlightly" else c("x", "q")
+  inter <- vapply(a, function(t) {
+    v <- c(paste0(t, ":SpeciesMOCH"), paste0("SpeciesMOCH:", t))
+    v[v %in% names(b)][1]
+  }, character(1))
+  stopifnot(!anyNA(inter))
+  if (target == "species_difference")
+    for (i in seq_along(a)) z[i, inter[i]] <- 1
+  if (target %in% c("BCCH_association", "MOCH_association")) {
+    for (i in seq_along(a)) z[i, a[i]] <- 1
+    if (target == "MOCH_association")
+      for (i in seq_along(a)) z[i, inter[i]] <- 1
+  }
+  if (target == "curvature") {
+    z[, ] <- 0
+    z[1, "q"] <- 1
+    z[2, inter[2]] <- 1
+  }
+  z
+}
+model_tests <- function(f, y, scheme = "all_attempts", category = FALSE) {
+  targets <- if (category)
+    c("species_difference", "BCCH_association", "MOCH_association") else c("species_difference", "BCCH_association", "MOCH_association", "curvature")
+  bind_rows(lapply(targets, function(t) cbind(data.frame(response = y, scheme = scheme, target = t,
+    n = nobs(f)), joint_test(f, test_contrast(f, t, category)))))
+}
+adjust_p_values <- function(d) d %>%
+  group_by(scheme, target) %>%
+  mutate(BH_p = p.adjust(p, "BH")) %>%
+  ungroup()
+fit_reproductive_model <- function(y, d, random_year = FALSE, category = FALSE, extra = "") {
+  rhs <- if (category)
+    "category * Species" else "(x + q) * Species"
+  rhs <- paste(rhs, "+ Elevation_km +", if (random_year)
+    "(1 | Year)" else "factor(Year)", extra)
+  fm <- as.formula(paste(y, "~", rhs))
+  if (y %in% count_responses) {
+    f <- glmmTMB(fm, data = d, family = compois(link = "log"), dispformula = if (y == "Egg_Number")
+      ~Species else ~1, control = glmmTMBControl(optCtrl = list(iter.max = 10000, eval.max = 10000)))
+    stopifnot(f$fit$convergence == 0, isTRUE(f$sdr$pdHess))
+  } else if (random_year)
+    f <- lmerTest::lmer(fm, data = d, REML = FALSE) else f <- lm(fm, data = d)
+  stopifnot(!anyNA(fixed_estimates(f)))
+  f
+}
+select_attempts <- function(d, scheme) {
+  d <- d[order(d$Year, d$.row), ]
+  if (scheme == "first_pair")
+    d <- d[!duplicated(d$.canonical_pair), ]
+  if (scheme == "first_male")
+    d <- d[!duplicated(d$Male.ID), ]
+  if (scheme == "first_female")
+    d <- d[!duplicated(d$Female.ID), ]
+  if (scheme == "exclude_inferred_roles")
+    d <- d[!d$Male.ID %in% inferred_ids & !d$Female.ID %in% inferred_ids, ]
+  if (scheme == "no_shared_parent") {
+    used <- character()
+    keep <- logical(nrow(d))
+    for (i in seq_len(nrow(d))) {
+      ids <- c(d$Male.ID[i], d$Female.ID[i])
+      if (!any(ids %in% used)) {
+        keep[i] <- TRUE
+        used <- c(used, ids)
+      }
+    }
+    d <- d[keep, ]
+    stopifnot(!anyDuplicated(c(d$Male.ID, d$Female.ID)))
+  }
+  d
+}
+```
+
+## Reproductive models (Table 1 and Tables S3–S9)
+
+```{r reproduction}
+primary <- list()
+rows <- list()
+full <- list()
+meta <- list()
+members <- list()
+for (y in responses) {
+  d <- BS[complete.cases(BS[c(y, "x", "q", "Species", "Elevation_km", "Year")]), ]
+  f <- fit_reproductive_model(y, d)
+  primary[[y]] <- f
+  rows[[y]] <- model_tests(f, y)
+  full[[y]] <- cbind(data.frame(response = y), coefficient_table(f))
+  meta[[y]] <- data.frame(response = y, n = nobs(f), family = if (y %in% count_responses)
+    "COM-Poisson" else "Gaussian", link = if (y %in% count_responses)
+    "log" else "identity", residual_SD_or_dispersion = sigma(f))
+  members[[y]] <- cbind(data.frame(response = y), d[c(".row", "Year", "Species", "Nestbox",
+    "Male.ID", "Female.ID", "Pair.ID")])
+}
+primary_tests <- adjust_p_values(bind_rows(rows))
+write.csv(primary_tests, file.path(output_dir, "primary_joint_tests.csv"), row.names = FALSE)
+write.csv(bind_rows(full), file.path(output_dir, "primary_full_coefficients.csv"), row.names = FALSE)
+write.csv(bind_rows(meta), file.path(output_dir, "model_metadata.csv"), row.names = FALSE)
+write.csv(bind_rows(members), file.path(output_dir, "primary_retained_attempts.csv"), row.names = FALSE)
+write.csv(primary_tests %>%
+  filter(target == "species_difference"), file.path(output_dir, "Table_1.csv"), row.names = FALSE)
+for (i in seq_along(responses)) write.csv(full[[responses[i]]], file.path(output_dir, paste0("Table_S",
+  i + 2, "_coefficients.csv")), row.names = FALSE)
+primary_tests
+```
+
+## Repeated parents and year (Table S10)
+
+```{r sensitivity}
+sensitivity <- list()
+sens_tests <- list()
+sens_meta <- list()
+sens_members <- list()
+for (y in responses) {
+  eligible <- BS[complete.cases(BS[c(y, "x", "q", "Species", "Elevation_km", "Year")]), ]
+  for (scheme in c("first_pair", "first_male", "first_female", "no_shared_parent", "exclude_inferred_roles",
+    "random_year")) {
+    d <- select_attempts(eligible, scheme)
+    f <- fit_reproductive_model(y, d, random_year = scheme == "random_year")
+    key <- paste(y, scheme, sep = "|")
+    sensitivity[[key]] <- f
+    sens_tests[[key]] <- model_tests(f, y, scheme)
+    sens_members[[key]] <- cbind(data.frame(response = y, scheme = scheme), d[c(".row",
+      "Year", "Species", "Nestbox", "Male.ID", "Female.ID", "Pair.ID")])
+    yrvar <- if (scheme != "random_year")
+      NA_real_ else if (inherits(f, "glmmTMB"))
+      as.numeric(VarCorr(f)$cond$Year[1]) else as.data.frame(VarCorr(f))$vcov[1]
+    sens_meta[[key]] <- data.frame(response = y, scheme = scheme, n = nobs(f), year_variance = yrvar,
+      boundary = if (is.na(yrvar))
+        NA else yrvar < 1e-08)
+  }
+}
+sensitivity_tests <- adjust_p_values(bind_rows(sens_tests))
+write.csv(sensitivity_tests, file.path(output_dir, "Table_S10_identity_and_year_joint_tests.csv"),
+  row.names = FALSE)
+write.csv(bind_rows(sens_meta), file.path(output_dir, "sensitivity_model_metadata.csv"), row.names = FALSE)
+write.csv(bind_rows(sens_members), file.path(output_dir, "sensitivity_retained_attempts.csv"),
+  row.names = FALSE)
+sensitivity_tests
+```
+
+## Slightly and much larger males (Table S11)
+
+```{r categories}
+categories <- list()
+category_tests <- list()
+category_coefs <- list()
+category_contrasts <- list()
+for (y in responses) {
+  d <- BS[BS$Wing_Difference > 0 & complete.cases(BS[c(y, "Wing_Difference", "Species", "Elevation_km",
+    "Year")]), ]
+  d$category <- factor(d$Wing_Difference_Category, levels = c("Much", "Slightly"))
+  f <- fit_reproductive_model(y, d, category = TRUE)
+  categories[[y]] <- f
+  category_tests[[y]] <- model_tests(f, y, category = TRUE)
+  category_coefs[[y]] <- cbind(data.frame(response = y), coefficient_table(f))
+  for (sp in c("BCCH", "MOCH")) {
+    L <- test_contrast(f, paste0(sp, "_association"), category = TRUE)
+    b <- fixed_estimates(f)
+    est <- as.numeric(L %*% b)
+    se <- sqrt(as.numeric(L %*% fixed_covariance(f) %*% t(L)))
+    df <- if (inherits(f, "lm"))
+      df.residual(f) else Inf
+    category_contrasts[[paste(y, sp)]] <- data.frame(response = y, Species = sp, n = nobs(f),
+      estimate = est, SE = se, CI_low = est - qt(0.975, df) * se, CI_high = est + qt(0.975,
+        df) * se)
+  }
+}
+category_tests <- adjust_p_values(bind_rows(category_tests))
+write.csv(category_tests, file.path(output_dir, "Table_S11_categorical_joint_tests.csv"), row.names = FALSE)
+write.csv(bind_rows(category_coefs), file.path(output_dir, "categorical_full_coefficients.csv"),
+  row.names = FALSE)
+write.csv(bind_rows(category_contrasts), file.path(output_dir, "categorical_derived_species_contrasts.csv"),
+  row.names = FALSE)
+category_tests
+```
+
+## Nestling mass with and without brood size (Table S12)
+
+```{r brood_size}
+d <- BS[complete.cases(BS[c("Avg_Nestling_Weight", "Nestling_Number", "x", "q", "Species",
+  "Elevation_km", "Year")]), ]
+brood_models <- list(base = fit_reproductive_model("Avg_Nestling_Weight", d), brood_adjusted = fit_reproductive_model("Avg_Nestling_Weight",
+  d, extra = "+ Nestling_Number * Species"))
+brood_tests <- bind_rows(lapply(names(brood_models), function(k) model_tests(brood_models[[k]],
+  "Avg_Nestling_Weight", scheme = k)))
+write.csv(brood_tests, file.path(output_dir, "Table_S12_brood_adjusted_joint_tests.csv"), row.names = FALSE)
+write.csv(bind_rows(lapply(names(brood_models), function(k) cbind(data.frame(model = k), coefficient_table(brood_models[[k]])))),
+  file.path(output_dir, "brood_adjusted_full_coefficients.csv"), row.names = FALSE)
+brood_tests
+```
+
+## Parental mass at a given wing length (Table S14)
+
+```{r parent_mass}
+mass_models <- list()
+mass_tests <- list()
+mass_coefs <- list()
+for (sex in c("Female", "Male")) {
+  d <- BS
+  d$Mass <- d[[paste0(sex, ".Weight")]]
+  d$OwnWing <- d[[paste0(sex, ".Wing.Chord")]]
+  d <- d[complete.cases(d[c("Mass", "OwnWing", "x", "q", "Species", "Elevation_km", "Year")]) &
+    d$Mass > 0 & d$OwnWing > 0, ]
+  d$logMass <- log(d$Mass)
+  d$logWing <- log(d$OwnWing)
+  for (scheme in c("all_attempts", "no_shared_parent")) {
+    dd <- select_attempts(d, scheme)
+    f <- lm(logMass ~ (x + q) * Species + logWing * Species + Elevation_km + factor(Year),
+      dd)
+    key <- paste(sex, scheme, sep = "|")
+    mass_models[[key]] <- f
+    mass_coefs[[key]] <- cbind(data.frame(parent = sex, scheme = scheme), coefficient_table(f))
+    for (covariance in c("model", "HC3")) for (target in c("species_difference", "BCCH_association",
+      "MOCH_association", "curvature")) {
+      V <- if (covariance == "HC3")
+        sandwich::vcovHC(f, type = "HC3") else vcov(f)
+      mass_tests[[paste(key, covariance, target)]] <- cbind(data.frame(parent = sex,
+        scheme = scheme, covariance = covariance, target = target, n = nobs(f)), joint_test(f,
+        test_contrast(f, target), V))
+    }
+  }
+}
+mass_tests <- bind_rows(mass_tests) %>%
+  group_by(scheme, covariance, target) %>%
+  mutate(BH_p_two_sexes = p.adjust(p, "BH")) %>%
+  ungroup()
+write.csv(mass_tests, file.path(output_dir, "Table_S14_conditional_mass_joint_tests.csv"),
+  row.names = FALSE)
+write.csv(bind_rows(mass_coefs), file.path(output_dir, "conditional_mass_full_coefficients.csv"),
+  row.names = FALSE)
+mass_tests
+```
+
+## Predicted reproductive outcomes (Figure 3)
+
+```{r predictions}
+predict_response <- function(f, grid) {
+  grid$x <- grid$Wing_Difference - wing_center
+  grid$q <- grid$x^2
+  pred <- predict(f, newdata = grid, se.fit = TRUE, type = if (inherits(f, "glmmTMB"))
+    "link" else "response")
+  crit <- if (inherits(f, "lm"))
+    qt(0.975, df.residual(f)) else qnorm(0.975)
+  grid$predicted <- as.numeric(pred$fit)
+  grid$CI_low <- grid$predicted - crit * as.numeric(pred$se.fit)
+  grid$CI_high <- grid$predicted + crit * as.numeric(pred$se.fit)
+  if (inherits(f, "glmmTMB"))
+    grid[c("predicted", "CI_low", "CI_high")] <- lapply(grid[c("predicted", "CI_low", "CI_high")],
+      exp)
+  grid
+}
+prediction_rows <- list()
+endpoints <- list()
+plots <- list()
+ylabs <- c("First-egg date (day of year)", "Clutch size", "Brood size at day 12", "Average nestling mass (g)",
+  "Female SMI (g)", "Male SMI (g)", "Provisioning rate (visits/h)")
+for (i in seq_along(responses)) {
+  y <- responses[i]
+  d <- BS[complete.cases(BS[c(y, "x", "q", "Species", "Elevation_km", "Year")]), ]
+  f <- primary[[y]]
+  for (sp in c("BCCH", "MOCH")) {
+    rg <- range(d$Wing_Difference[d$Species == sp])
+    g <- data.frame(Wing_Difference = seq(rg[1], rg[2], length.out = 201), Species = factor(sp,
+      levels = c("BCCH", "MOCH")), Elevation_km = median(d$Elevation_km), Year = 2024)
+    pr <- predict_response(f, g)
+    pr$response <- y
+    prediction_rows[[paste(y, sp)]] <- pr
+    ep <- pr[c(1, nrow(pr)), ]
+    ep$endpoint <- c("minimum", "maximum")
+    endpoints[[paste(y, sp)]] <- ep
+  }
+  preds <- bind_rows(prediction_rows)[bind_rows(prediction_rows)$response == y, ]
+  plots[[y]] <- ggplot(d, aes(Wing_Difference, .data[[y]], color = Species)) + geom_point(size = 1.5,
+    alpha = 0.65) + geom_ribbon(data = preds, aes(y = NULL, ymin = CI_low, ymax = CI_high,
+    fill = Species), color = NA, alpha = 0.14) + geom_line(data = preds, aes(y = predicted),
+    linewidth = 0.8) + scale_color_manual(values = c(BCCH = "#0072B2", MOCH = "#CC79A7")) +
+    scale_fill_manual(values = c(BCCH = "#0072B2", MOCH = "#CC79A7")) + labs(x = "Male-minus-female wing length (mm)",
+    y = ylabs[i]) + theme_classic(base_size = 10) + theme(legend.position = "bottom")
+}
+predictions <- bind_rows(prediction_rows)
+write.csv(predictions, file.path(output_dir, "pooled_quadratic_predictions.csv"), row.names = FALSE)
+write.csv(bind_rows(endpoints), file.path(output_dir, "prediction_endpoints.csv"), row.names = FALSE)
+key_data <- data.frame(Species = c("BCCH", "MOCH"), y = c(0.64, 0.36))
+key <- ggplot(key_data, aes(y = y)) + geom_segment(aes(x = 0.1, xend = 0.37, yend = y, color = Species),
+  linewidth = 1.6) + geom_point(aes(x = 0.235, fill = Species), shape = 21, color = "black",
+  size = 4.3, stroke = 0.35) + geom_text(aes(x = 0.45, label = Species), hjust = 0, size = 6) +
+  scale_color_manual(values = species_colors) + scale_fill_manual(values = species_colors) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) + theme_void() + theme(legend.position = "none")
+figure <- wrap_plots(c(plots, list(wrap_elements(full = key, ignore_tag = TRUE))), ncol = 2) +
+  plot_annotation(tag_levels = "A")
+ggsave(file.path(output_dir, "figures/Figure_3_pooled_quadratic.png"), figure, width = 9, height = 11,
+  dpi = 600, bg = "white")
+bind_rows(endpoints)
+```
+
+## Reproductive traits by pair category (Figure S1)
+
+```{r category_plot}
+catdata <- BS[BS$Wing_Difference > 0, ]
+catdata$category <- factor(catdata$Wing_Difference_Category, levels = c("Much", "Slightly"))
+catplots <- lapply(seq_along(responses), function(i) ggplot(catdata, aes(category, .data[[responses[i]]],
+  fill = Species)) + geom_boxplot(outlier.shape = NA, position = position_dodge(0.8), width = 0.65) +
+  geom_point(aes(color = Species), position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.8,
+    seed = 2026), size = 1, alpha = 0.5) + scale_fill_manual(values = c(BCCH = "#0072B2",
+  MOCH = "#CC79A7")) + scale_color_manual(values = c(BCCH = "#0072B2", MOCH = "#CC79A7")) +
+  labs(x = "Male-larger category", y = ylabs[i]) + theme_classic(base_size = 10))
+cf <- (wrap_plots(catplots, ncol = 2, guides = "collect") + plot_annotation(tag_levels = "A")) &
+  theme(legend.position = "bottom")
+ggsave(file.path(output_dir, "figures/Figure_S1_categories_descriptive.png"), cf, width = 9,
+  height = 11, dpi = 600, bg = "white")
+```
+
+## Model diagnostics and collinearity (Table S13)
+
+```{r diagnostics}
+diag <- list()
+pdf(file.path(output_dir, "primary_model_residual_plots.pdf"), width = 8, height = 7)
+for (i in seq_along(responses)) {
+  y <- responses[i]
+  f <- primary[[y]]
+  if (y %in% count_responses) {
+    sim <- simulateResiduals(f, n = 2000, seed = 8110 + i, plot = FALSE)
+    plot(sim)
+    diag[[y]] <- data.frame(response = y, n = nobs(f), convergence = f$fit$convergence,
+      PD_Hessian = f$sdr$pdHess, uniformity_p = testUniformity(sim, plot = FALSE)$p.value,
+      dispersion_p = testDispersion(sim, plot = FALSE)$p.value, outlier_p = testOutliers(sim,
+        plot = FALSE, type = "bootstrap")$p.value)
+  } else {
+    par(mfrow = c(2, 2))
+    plot(f)
+    par(mfrow = c(1, 1))
+    diag[[y]] <- data.frame(response = y, n = nobs(f), residual_SD = sigma(f), rank = f$rank)
+  }
+}
+dev.off()
+write.csv(bind_rows(diag), file.path(output_dir, "Table_S13_primary_diagnostics.csv"), row.names = FALSE)
+vifs <- list()
+gvifs <- list()
+for (y in names(primary)) {
+  f <- primary[[y]]
+  X <- model.matrix(f)
+  assignment <- attr(X, "assign")
+  XX <- X[, colnames(X) != "(Intercept)", drop = FALSE]
+  v <- sapply(seq_len(ncol(XX)), function(j) 1/(1 - summary(lm(XX[, j] ~ XX[, -j, drop = FALSE]))$r.squared))
+  vifs[[y]] <- data.frame(response = y, column = colnames(XX), VIF = v)
+  V <- fixed_covariance(f)
+  R <- cov2cor(V[rownames(V) != "(Intercept)", colnames(V) != "(Intercept)", drop = FALSE])
+  aa <- assignment[assignment != 0]
+  labels <- attr(terms(formula(f)), "term.labels")
+  gvifs[[y]] <- bind_rows(lapply(sort(unique(aa)), function(a) {
+    idx <- which(aa == a)
+    other <- setdiff(seq_len(nrow(R)), idx)
+    g <- det(R[idx, idx, drop = FALSE]) * det(R[other, other, drop = FALSE])/det(R)
+    data.frame(response = y, term = labels[a], df = length(idx), GVIF = g, adjusted_GVIF = g^(1/(2 *
+      length(idx))))
+  }))
+}
+write.csv(bind_rows(vifs), file.path(output_dir, "full_design_VIF.csv"), row.names = FALSE)
+write.csv(bind_rows(gvifs), file.path(output_dir, "term_GVIF.csv"), row.names = FALSE)
+writeLines(capture.output(sessionInfo()), file.path(output_dir, "session_info.txt"))
+bind_rows(diag)
+```
